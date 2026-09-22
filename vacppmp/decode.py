@@ -60,6 +60,7 @@ class Decoded:
     src_ip: str = ""
     dst_ip: str = ""
     ip_version: int = 0
+    transport: str = ""
     proto: str = ""
     src_port: int = 0
     dst_port: int = 0
@@ -67,20 +68,25 @@ class Decoded:
     dns_names: list[str] = field(default_factory=list)
     http_host: str = ""
     http_method: str = ""
+    http_status: int = 0
     tls_sni: str = ""
+    tcp_flags: str = ""
     arp_spa: str = ""
     arp_tpa: str = ""
+    icmp_type: int = 0
+    icmp_code: int = 0
+    icmp_target: str = ""
 
 
 def _mac(raw: bytes) -> str:
     return ":".join(f"{byte:02x}" for byte in raw)
 
 
-def _ipv4(raw: bytes) -> str:
+def _fmt_ipv4(raw: bytes) -> str:
     return str(ipaddress.IPv4Address(raw))
 
 
-def _ipv6(raw: bytes) -> str:
+def _fmt_ipv6(raw: bytes) -> str:
     return str(ipaddress.IPv6Address(raw))
 
 
@@ -187,14 +193,18 @@ def _ipv4_packet(payload: bytes, frame: Decoded) -> Decoded:
         return frame
     proto = payload[9]
     frame.ip_version = 4
-    frame.src_ip = _ipv4(payload[12:16])
-    frame.dst_ip = _ipv4(payload[16:20])
-    frame.proto = IP_PROTO.get(proto, f"ip-{proto}")
+    frame.src_ip = _fmt_ipv4(payload[12:16])
+    frame.dst_ip = _fmt_ipv4(payload[16:20])
+    frame.transport = IP_PROTO.get(proto, "")
     body = payload[ihl:]
     if proto == 6:
         return _tcp(body, frame)
     if proto == 17:
         return _udp(body, frame)
+    if proto == 1:
+        return _icmp(body, frame)
+    if not frame.proto:
+        frame.proto = IP_PROTO.get(proto) or f"ip-{proto}"
     return frame
 
 
@@ -205,31 +215,40 @@ def _ipv6(payload: bytes, frame: Decoded) -> Decoded:
         return frame
     nxt = payload[6]
     frame.ip_version = 6
-    frame.src_ip = _ipv6(payload[8:24])
-    frame.dst_ip = _ipv6(payload[24:40])
+    frame.src_ip = _fmt_ipv6(payload[8:24])
+    frame.dst_ip = _fmt_ipv6(payload[24:40])
     offset = 40
     for _ in range(8):
-        if nxt in (0, 43, 44, 60) and len(payload) >= offset + 2:
-            nxt = payload[offset]
-            ext_len = (payload[offset + 1] + 1) * 8
-            offset += ext_len
+        if nxt not in (0, 44, 60):
+            break
+        if offset + 2 > len(payload):
+            break
+        head_type = payload[offset]
+        nxt = head_type
+        if head_type == 44:
+            offset = min(len(payload), offset + 8)
             continue
-        break
-    frame.proto = IP_PROTO.get(nxt, f"ip-{nxt}")
+        offset = min(len(payload), offset + (payload[offset + 1] + 1) * 8)
+    frame.transport = IP_PROTO.get(nxt, "")
     body = payload[offset:]
     if nxt == 6:
         return _tcp(body, frame)
     if nxt == 17:
         return _udp(body, frame)
+    if nxt == 58:
+        return _icmpv6(body, frame)
+    if not frame.proto:
+        frame.proto = IP_PROTO.get(nxt) or f"ip-{nxt}"
     return frame
 
 
 def _arp(payload: bytes, frame: Decoded) -> Decoded:
+    frame.transport = "ARP"
     frame.proto = "ARP"
     if len(payload) < 28:
         return frame
-    frame.arp_spa = _ipv4(payload[14:18])
-    frame.arp_tpa = _ipv4(payload[24:28])
+    frame.arp_spa = _fmt_ipv4(payload[14:18])
+    frame.arp_tpa = _fmt_ipv4(payload[24:28])
     frame.src_ip = frame.arp_spa
     frame.dst_ip = frame.arp_tpa
     return frame
@@ -239,6 +258,8 @@ def _tcp(payload: bytes, frame: Decoded) -> Decoded:
     if len(payload) < 20:
         return frame
     frame.src_port, frame.dst_port = struct.unpack("!HH", payload[0:4])
+    frame.transport = "TCP"
+    frame.tcp_flags = _tcp_flags(payload[13])
     offset = ((payload[12] >> 4) & 0x0F) * 4
     body = payload[offset:] if offset >= 20 else payload[20:]
     _app(frame, body)
@@ -249,50 +270,91 @@ def _udp(payload: bytes, frame: Decoded) -> Decoded:
     if len(payload) < 8:
         return frame
     frame.src_port, frame.dst_port = struct.unpack("!HH", payload[0:4])
+    frame.transport = "UDP"
     _app(frame, payload[8:])
     return frame
+
+
+def _icmp(payload: bytes, frame: Decoded) -> Decoded:
+    """Decode an IPv4 ICMP packet; echo carries the real target address."""
+    frame.transport = "ICMP"
+    frame.proto = "ICMP"
+    if len(payload) < 4:
+        return frame
+    frame.icmp_type = payload[0]
+    frame.icmp_code = payload[1]
+    if frame.icmp_type in (8, 0) and len(payload) >= 28:
+        frame.icmp_target = _fmt_ipv4(payload[24:28])
+    return frame
+
+
+def _icmpv6(payload: bytes, frame: Decoded) -> Decoded:
+    frame.transport = "ICMPv6"
+    frame.proto = "ICMPv6"
+    if len(payload) < 4:
+        return frame
+    frame.icmp_type = payload[0]
+    frame.icmp_code = payload[1]
+    if frame.icmp_type in (128, 129) and len(payload) >= 48:
+        frame.icmp_target = _fmt_ipv6(payload[32:48])
+    return frame
+
+
+def _tcp_flags(raw: int) -> str:
+    names = [("NS", 1), ("CWR", 2), ("ECE", 4), ("URG", 8), ("ACK", 16), ("PSH", 32), ("RST", 64), ("SYN", 128)]
+    out = [label for label, mask in names if raw & mask]
+    return "".join(out) if out else "NONE"
 
 
 def _app(frame: Decoded, body: bytes) -> None:
     ports = {frame.src_port, frame.dst_port}
     if 53 in ports:
-        frame.dns_names = _dns_names(body)
-        if frame.dns_names:
+        names = _dns_names(body)
+        if names:
+            frame.dns_names = names
             frame.proto = "DNS"
             return
-    if 80 in ports or 8080 in ports:
-        host, method = _http(body)
-        if host or method:
-            frame.http_host = host
-            frame.http_method = method
-            frame.proto = "HTTP"
-            return
+    host, method, status, is_http = _http(body)
+    if is_http:
+        frame.http_host = host
+        frame.http_method = method
+        frame.http_status = status
+        frame.proto = "HTTP"
+        return
     if 443 in ports:
         sni = _tls_sni(body)
         if sni:
             frame.tls_sni = sni
-            frame.proto = "TLS"
-            return
+        frame.proto = "TLS"
+        return
     service = WELL_KNOWN.get(frame.dst_port) or WELL_KNOWN.get(frame.src_port)
-    if service and frame.proto in {"TCP", "UDP"}:
-        frame.proto = service.upper() if service not in {"http", "https"} else frame.proto
+    if service and not frame.proto:
+        frame.proto = service.upper()
+    if not frame.proto:
+        frame.proto = frame.transport
+
 
 
 def _dns_names(payload: bytes) -> list[str]:
     if len(payload) < 12:
         return []
+    flags = struct.unpack("!H", payload[2:4])[0]
     questions = struct.unpack("!H", payload[4:6])[0]
-    if questions == 0 or questions > 64:
-        return []
-    offset = 12
+    answers = struct.unpack("!H", payload[6:8])[0]
     names: list[str] = []
-    for _ in range(questions):
-        name, offset = _dns_label(payload, offset)
-        if offset + 4 > len(payload):
-            break
+    offset = 12
+    if questions:
+        for _ in range(min(questions, 64)):
+            name, offset = _dns_label(payload, offset)
+            if offset + 4 > len(payload):
+                break
+            if name and name not in names:
+                names.append(name)
+            offset += 4
+    if not names and (flags & 0x8000) and answers and len(payload) >= 16:
+        name, _ = _dns_label(payload, offset)
         if name:
             names.append(name)
-        offset += 4
     return names
 
 
@@ -334,26 +396,36 @@ def _decode_label(raw: bytes) -> str:
         return raw.decode("ascii", errors="replace")
 
 
-def _http(payload: bytes) -> tuple[str, str]:
+def _http(payload: bytes) -> tuple[str, str, int, bool]:
     if not payload:
-        return "", ""
+        return "", "", 0, False
     try:
         text = payload.split(b"\r\n\r\n", 1)[0].decode("ascii", errors="strict")
     except UnicodeDecodeError:
-        return "", ""
-    lines = text.split("\r\n")
+        try:
+            text = payload.split(b"\n\n", 1)[0].decode("ascii", errors="strict")
+        except UnicodeDecodeError:
+            return "", "", 0, False
+    lines = text.replace("\r\n", "\n").split("\n")
     if not lines:
-        return "", ""
-    first = lines[0]
+        return "", "", 0, False
+    parts = lines[0].split()
     method = ""
-    if first.startswith(("GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH ")):
-        method = first.split(" ", 1)[0]
+    status = 0
+    is_http = False
+    if len(parts) >= 2 and parts[0].startswith("HTTP/"):
+        is_http = True
+        if parts[1].isdigit():
+            status = int(parts[1])
+    elif len(parts) >= 3 and parts[2].startswith("HTTP/") and parts[0].isalpha():
+        is_http = True
+        method = parts[0]
     host = ""
     for line in lines[1:]:
         if line.lower().startswith("host:"):
             host = line.split(":", 1)[1].strip()
             break
-    return host, method
+    return host, method, status, is_http
 
 
 def _tls_sni(payload: bytes) -> str:
@@ -408,10 +480,16 @@ def service_name(port: int) -> str:
     return WELL_KNOWN.get(port, "")
 
 
-def flow_key(frame: Decoded) -> tuple[str, str, str, int, int]:
-    """Return a bidirectional flow key with endpoints ordered."""
+def flow_key(frame: Decoded) -> tuple[str, int, str, int, str]:
+    """Return a bidirectional flow key ordered by endpoint, transport-stable.
+
+    The key only uses addresses and ports. Application labels (DNS, TLS, ...)
+    differ between the handshake packet and the data packets of the same
+    connection, so folding them into the key would split one flow in two.
+    """
     left = (frame.src_ip, frame.src_port)
     right = (frame.dst_ip, frame.dst_port)
+    proto = frame.transport or frame.proto or frame.ethertype or ""
     if left <= right:
-        return frame.src_ip, frame.dst_ip, frame.proto, frame.src_port, frame.dst_port
-    return frame.dst_ip, frame.src_ip, frame.proto, frame.dst_port, frame.src_port
+        return frame.src_ip, frame.src_port, frame.dst_ip, frame.dst_port, proto
+    return frame.dst_ip, frame.dst_port, frame.src_ip, frame.src_port, proto

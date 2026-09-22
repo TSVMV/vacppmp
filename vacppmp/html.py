@@ -6,7 +6,7 @@ import html
 import math
 from datetime import UTC, datetime
 
-from .stats import Report
+from .stats import BUCKETS, Report, port_label
 
 __all__ = ["render"]
 
@@ -101,6 +101,75 @@ def _layout(report: Report, width: int = 920, height: int = 560) -> tuple[str, i
     return svg, svg_height
 
 
+def _timeline_svg(report: Report, width: int = 1040, height: int = 200) -> str:
+    """Render bytes and packets per bucket as two stacked SVG areas."""
+    if not report.timeline:
+        return "<p class='sub'>该格式不含时间戳，无法绘制时间分布</p>"
+    series = report.timeline
+    if len(series) == 1:
+        series = series + [[0, 0]]
+    pad_left, pad_right, pad_top, pad_bottom = 56, 16, 14, 30
+    plot_w = width - pad_left - pad_right
+    plot_h = height - pad_top - pad_bottom
+    slots = len(series)
+    bar_w = plot_w / slots
+    max_bytes = max(b for b, _p in series) or 1
+    max_pkts = max(p for _b, p in series) or 1
+    parts = [
+        (
+            f'<svg viewBox="0 0 {width} {height}" width="100%" preserveAspectRatio="xMidYMid meet" '
+            f'role="img" aria-label="时间分布">'
+        )
+    ]
+    for bucket, (bytes_, packets) in enumerate(series):
+        x = pad_left + bucket * bar_w
+        h1 = plot_h * bytes_ / max_bytes
+        h2 = plot_h * packets / max_pkts
+        parts.append(
+            f'<rect x="{x:.2f}" y="{pad_top + plot_h - h1:.2f}" width="{max(1.0, bar_w * 0.62):.2f}" '
+            f'height="{max(0.0, h1):.2f}" fill="#58a6ff" opacity="0.85">'
+            f'<title>{_stamp(report.first_ts + (bucket / (slots - 1)) * report.duration)}'
+            f'  {_esc(_size(bytes_))}  {packets} pkts</title></rect>'
+        )
+        parts.append(
+            f'<rect x="{x + max(1.0, bar_w * 0.62) + 1:.2f}" y="{pad_top + plot_h - h2:.2f}" '
+            f'width="{max(1.0, bar_w * 0.24):.2f}" height="{max(0.0, h2):.2f}" '
+            f'fill="#63e6be" opacity="0.75">'
+            f'<title>{_esc(_size(bytes_))}  {packets} pkts</title></rect>'
+        )
+    parts.append(
+        f'<text x="{pad_left}" y="{pad_top + 10}" fill="#8b949e" font-size="11">峰值 {_esc(_size(max_bytes))} / 段</text>'
+    )
+    parts.append(
+        f'<line x1="{pad_left}" y1="{pad_top + plot_h}" x2="{width - pad_right}" y2="{pad_top + plot_h}" '
+        f'stroke="#30363d"/>'
+    )
+    start, end = _stamp(report.first_ts), _stamp(report.last_ts)
+    parts.append(
+        f'<text x="{pad_left}" y="{height - 8}" fill="#8b949e" font-size="11">{_esc(start)}</text>'
+    )
+    parts.append(
+        f'<text x="{width - pad_right}" y="{height - 8}" text-anchor="end" fill="#8b949e" '
+        f'font-size="11">{_esc(end)}</text>'
+    )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _icmp_label(icmp_type: int) -> str:
+    labels = {
+        0: "echo-reply",
+        3: "unreachable",
+        5: "redirect",
+        8: "echo-request",
+        11: "exceeded",
+        128: "v6 echo-request",
+        129: "v6 echo-reply",
+        135: "v6 destination-unreachable",
+    }
+    return labels.get(icmp_type, "?")
+
+
 def _table(headers: list[str], rows: list[list[str]]) -> str:
     head = "".join(f"<th>{_esc(item)}</th>" for item in headers)
     body = []
@@ -117,6 +186,10 @@ def render(report: Report, top: int = 20) -> str:
     proto_rows = [
         [name, str(count), f"{100 * count / proto_total:.1f}%"]
         for name, count in report.protocols.most_common(top)
+    ]
+    tx_rows = [
+        [name, str(count), f"{100 * count / sum(report.transports.values()) or 1:.1f}%"]
+        for name, count in report.transports.most_common(top)
     ]
     host_rows = []
     for host in sorted(report.hosts.values(), key=lambda item: item.bytes, reverse=True)[:top]:
@@ -144,6 +217,15 @@ def render(report: Report, top: int = 20) -> str:
             ]
         )
     name_rows = [[name, str(count)] for name, count in report.names.most_common(top)]
+    port_rows = [
+        [port_label(port), str(port), str(count)]
+        for port, count in report.ports.most_common(top)
+    ]
+    flag_rows = [[name, str(count)] for name, count in report.flags.most_common(top)]
+    status_rows = [[str(status), str(count)] for status, count in report.http_status.most_common(top)]
+    icmp_rows = []
+    for icmp_type, count in report.icmps.most_common(top):
+        icmp_rows.append([str(icmp_type), _icmp_label(icmp_type), str(count)])
     conv_rows = [
         [src, dst, _size(total)] for src, dst, total, _fwd in report.conversations[:top]
     ]
@@ -215,14 +297,27 @@ footer {{ color: var(--muted); margin-top: 40px; font-size: 12px; }}
   </section>
   <h2>主机通信图</h2>
   <div class="map">{svg}</div>
-  <h2>协议分布</h2>
+  <h2>时间分布</h2>
+  <p class="sub">左块：字节；右块：包数；每段约 {report.duration / BUCKETS:.3f} 秒（{BUCKETS} 段）</p>
+  <div class="map">{_timeline_svg(report)}</div>
+  <h2>传输层</h2>
+  {_table(["传输层", "包数", "占比"], tx_rows)}
+  <h2>应用协议</h2>
   {_table(["协议", "包数", "占比"], proto_rows)}
+  <h2>端口 / 服务</h2>
+  {_table(["服务", "端口", "包数"], port_rows) if port_rows else "<p class='sub'>没有 TCP / UDP 端口</p>"}
   <h2>通信对</h2>
   {_table(["源", "目的", "字节"], conv_rows)}
   <h2>主机</h2>
   {_table(["IP", "字节", "包数", "端口", "名字"], host_rows)}
   <h2>流</h2>
   {_table(["协议", "源", "目的", "包数", "字节", "名字"], flow_rows)}
+  <h2>TCP 标志位</h2>
+  {_table(["标志", "包数"], flag_rows) if flag_rows else "<p class='sub'>没有 TCP 流量</p>"}
+  <h2>HTTP 状态码</h2>
+  {_table(["状态码", "次数"], status_rows) if status_rows else "<p class='sub'>没有解析到 HTTP 报文</p>"}
+  <h2>ICMP</h2>
+  {_table(["类型", "含义", "次数"], icmp_rows) if icmp_rows else "<p class='sub'>没有 ICMP 流量</p>"}
   <h2>解析到的名字</h2>
   {_table(["名字", "次数"], name_rows) if name_rows else "<p class='sub'>没有解析到 DNS / HTTP Host / TLS SNI</p>"}
   <footer>vacppmp 离线生成，未上传任何捕获数据。</footer>
